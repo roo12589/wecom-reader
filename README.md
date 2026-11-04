@@ -1,6 +1,6 @@
 # wecom-reader
 
-企业微信（WeCom）本地聊天记录读取工具。从 WXWork.exe 进程内存提取密钥，解密本地 SQLite 数据库，提供 CLI / Python 库 / Web UI 三种访问方式。
+企业微信（WeCom）本地聊天记录读取工具。从客户端进程内存提取密钥，解密本地 SQLite 数据库，提供 CLI / Python 库 / Web UI 三种访问方式。
 
 ## 原理
 
@@ -9,7 +9,7 @@
 - 密钥长度：16 字节（128 bit）
 - 密钥数量：**一个全局密钥**解密所有数据库（比个人微信简单得多）
 - 加密方式：每页独立派生 key/IV，无 HMAC，无 PBKDF2
-- 密钥提取：通过 Windows API 读取 WXWork.exe 进程内存
+- 密钥提取：通过 Windows API 读取客户端进程内存
 
 ## 安装
 
@@ -22,8 +22,15 @@ pip install pycryptodomex click flask
 ### CLI
 
 ```bash
-# 提取密钥 + 解密所有数据库（需要管理员权限，WXWork.exe 运行中）
+# 提取密钥 + 解密所有数据库（需要管理员权限，客户端运行中）
 python -m wecom_reader.cli init --db-dir "E:\WXWork\<account_id>\Data"
+# --db-dir / --decrypted-dir 既可以放在子命令后，也可以放在子命令前：
+python -m wecom_reader.cli --db-dir "E:\WXWork\<account_id>\Data" init
+
+# 私有化部署版本进程名通常不是 WXWork.exe（例如 airchina.exe），
+# 工具会自动识别；识别失败时再显式指定：
+python -m wecom_reader.cli init --process-name airchina.exe \
+    --db-dir "C:\Users\<user>\Documents\airchina\<account_id>\Data"
 
 # 查看状态
 python -m wecom_reader.cli status
@@ -39,6 +46,33 @@ python -m wecom_reader.cli search "关键词"
 
 # 查看联系人
 python -m wecom_reader.cli contacts --keyword "张三"
+```
+
+### 私有化部署版本（进程名不是 WXWork.exe）
+
+私有化版本会重命名客户端可执行文件，进程名不再是 `WXWork.exe`。本工具**自动识别**：
+先从 `--db-dir` 的路径推断厂商目录名（`...\Documents\airchina\<account>\Data` → `airchina.exe`），
+再与当前运行进程比对；找不到匹配时退回 `WXWork.exe`。
+
+```bash
+# 一般无需指定，自动识别即可：
+python -m wecom_reader.cli init --db-dir "C:\Users\<user>\Documents\airchina\<account_id>\Data"
+
+# 也可用环境变量指定：
+set WXWORK_PROCESS_NAME=airchina.exe
+```
+
+> **注意**：同一台机器上可能并存基于飞书的产品（如 `AirChina5.0.exe`）。
+> 它与基于企业微信的 `airchina.exe` 是两套独立程序，数据库互不通用；
+> 自动识别时会排除这类同名不同源的进程，请勿混用它们的 `--db-dir`。
+
+### 中文输出编码
+
+CLI 默认以 **UTF-8** 向标准输出写 JSON（不受 Windows 控制台 GBK 代码页影响），
+重定向或管道传给其它工具时中文不会乱码。若要沿用控制台原生编码：
+
+```bash
+set WECOM_READER_ENCODING=native
 ```
 
 ### Python 库

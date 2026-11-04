@@ -1,10 +1,16 @@
-"""Extract WeCom (企业微信) database decryption key from WXWork.exe process memory.
+"""Extract WeCom (企业微信) database decryption key from the client process memory.
 
-Two scanning strategies:
+Three scanning strategies:
 1. x'...' pattern: Fast regex match for SQL-embedded hex keys
-2. cipher struct: Slower but more reliable heap object layout scan
+2. sAlT proximity: 16-byte windows around the wxSQLite3 KDF marker ``"sAlT"``
+3. cipher struct: Slower but more reliable heap object layout scan
 
-Requires: Windows, admin privileges, WXWork.exe running.
+The client executable is auto-detected from the running processes and the data
+directory name (consumer builds ship ``WXWork.exe``; private deployments such as
+airchina use a renamed binary like ``airchina.exe``). Override with
+``--process-name`` or ``WXWORK_PROCESS_NAME``.
+
+Requires: Windows, admin privileges, the client running.
 """
 
 import bisect
@@ -72,16 +78,74 @@ def _enum_memory_regions(handle) -> list[tuple[int, int]]:
     return regs
 
 
-def _get_wxwork_pids() -> list[tuple[int, int]]:
-    """Get WXWork.exe PIDs sorted by memory usage (descending)."""
+DEFAULT_PROCESS_NAMES = ("WXWork.exe",)
+
+# Names of *other* products that often coexist with a private-deployment client
+# and must never be scanned by auto-detection (e.g. AirChina5.0.exe is the
+# Feishu-based build, not the WeCom-based airchina.exe).
+EXCLUDED_PROCESS_NAMES = frozenset({"airchina5.0.exe"})
+
+
+def _iter_processes() -> list[tuple[int, str]]:
+    """List running (pid, exe_name) pairs via a Toolhelp snapshot."""
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class _PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wt.DWORD),
+            ("cntUsage", wt.DWORD),
+            ("th32ProcessID", wt.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wt.DWORD),
+            ("cntThreads", wt.DWORD),
+            ("th32ParentProcessID", wt.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wt.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == -1 or snap is None:
+        return []
+    entry = _PROCESSENTRY32()
+    entry.dwSize = ctypes.sizeof(_PROCESSENTRY32)
+    found = []
+    try:
+        ok = kernel32.Process32First(snap, ctypes.byref(entry))
+        while ok:
+            found.append(
+                (entry.th32ProcessID, entry.szExeFile.decode("utf-8", "replace"))
+            )
+            ok = kernel32.Process32Next(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return found
+
+
+def _pids_via_toolhelp(exe_name: str) -> list[tuple[int, int]]:
+    """Enumerate PIDs by executable name with a Toolhelp snapshot.
+
+    Avoids spawning ``tasklist`` (which needs stdio pipes) so this works under
+    restricted sandboxes. Returns (pid, 0) tuples; memory size is unknown.
+    """
+    found = [
+        (pid, 0)
+        for pid, name in _iter_processes()
+        if name.lower() == exe_name.lower()
+    ]
+    return found
+
+
+def _pids_via_tasklist(exe_name: str) -> list[tuple[int, int]]:
+    """Enumerate PIDs via tasklist, including working-set size for sorting."""
     r = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq WXWork.exe", "/FO", "CSV", "/NH"],
+        ["tasklist", "/FI", f"IMAGENAME eq {exe_name}", "/FO", "CSV", "/NH"],
         capture_output=True,
         text=True,
     )
     pids = []
     for line in r.stdout.strip().split("\n"):
-        if not line.strip():
+        if not line.strip() or not line.startswith('"'):
             continue
         p = line.strip('"').split('","')
         if len(p) >= 5:
@@ -90,6 +154,83 @@ def _get_wxwork_pids() -> list[tuple[int, int]]:
             pids.append((pid, mem))
     pids.sort(key=lambda x: x[1], reverse=True)
     return pids
+
+
+def _get_wxwork_pids(exe_name: str = "WXWork.exe") -> list[tuple[int, int]]:
+    """Get client process PIDs sorted by memory usage (descending).
+
+    ``exe_name`` defaults to the consumer client, but private-deployment builds
+    ship a renamed binary (e.g. ``airchina.exe``), so callers can override it.
+    Falls back to a Toolhelp snapshot when ``tasklist`` cannot be spawned.
+    """
+    try:
+        return _pids_via_tasklist(exe_name)
+    except (OSError, subprocess.SubprocessError):
+        pids = _pids_via_toolhelp(exe_name)
+        pids.sort(key=lambda x: x[1], reverse=True)
+        return pids
+
+
+def _exe_candidates_from_dir(db_dir: Optional[str]) -> list[str]:
+    """Guess the client executable name from a ``Documents/<client>/...`` path.
+
+    ``...\\Documents\\airchina\\<account>\\Data`` -> ``airchina.exe``.
+    The vendor folder name is the best available hint for private deployments.
+    """
+    if not db_dir:
+        return []
+
+    current = os.path.abspath(db_dir)
+    parts = []
+    while True:
+        parent, tail = os.path.split(current)
+        if not tail or parent == current:
+            break
+        parts.append(tail)
+        current = parent
+
+    # parts are leaf-first: ["Data", "<account>", "airchina", "Documents", ...]
+    # so the vendor folder sits immediately *before* "Documents" in this order.
+    for idx, part in enumerate(parts):
+        if part.lower() == "documents" and idx >= 1:
+            return [parts[idx - 1] + ".exe"]
+    # Fallback: the folder two levels above the Data tree (Data -> account -> vendor).
+    if len(parts) >= 3:
+        return [parts[2] + ".exe"]
+    return []
+
+
+def resolve_process_names(
+    db_dir: Optional[str] = None,
+    process_names: Optional[list[str]] = None,
+) -> list[str]:
+    """Resolve which executable names should be scanned for the key.
+
+    Order of preference:
+    1. Explicit ``process_names`` (``--process-name`` / ``WXWORK_PROCESS_NAME``).
+    2. Running processes that match the vendor folder of ``db_dir``.
+    3. Running ``WXWork.exe`` (consumer client).
+    4. Untested guesses derived from the path, ending with ``WXWork.exe``.
+    """
+    if process_names:
+        return [n for n in process_names if n]
+
+    running = {name.lower(): name for _, name in _iter_processes()}
+    hinted = [n for n in _exe_candidates_from_dir(db_dir) if n.lower() in running]
+    if hinted:
+        return hinted
+    if "wxwork.exe" in running:
+        return [running["wxwork.exe"]]
+
+    guesses = _exe_candidates_from_dir(db_dir) + list(DEFAULT_PROCESS_NAMES)
+    seen = set()
+    unique = []
+    for name in guesses:
+        if name.lower() in seen or name.lower() in EXCLUDED_PROCESS_NAMES:
+            continue
+        seen.add(name.lower())
+        unique.append(name)
+    return unique
 
 
 def _auto_detect_db_dir() -> Optional[str]:
@@ -155,24 +296,94 @@ def _verify_key_wxwork(enc_key: bytes, db_page1: bytes) -> tuple[bool, str]:
     return False, ""
 
 
+SALT_MARKER = b"sAlT"
+# Linux/macOS builds and some blobs store the KDF salt as uppercase.
+SALT_MARKERS = (b"sAlT", b"SALT")
+KEY_LEN_HINTS = (16, 32, 48, 64)
+
+
+def _iter_marker_keys(data: bytes):
+    """Yield candidate 16-byte keys found next to a ``sAlT`` KDF marker.
+
+    Private-deployment builds keep the cipher key as an object laid out like::
+
+        [ ... ][ key:16 ][ key_len:4 ][ b"sAlT" ][ ... ]
+
+    so the key usually sits 20 bytes before the marker. We also try the
+    neighbouring windows because allocator padding / alignment varies between
+    builds.
+    """
+    for marker in SALT_MARKERS:
+        start = data.find(marker)
+        while start != -1:
+            # Explicit key-length field directly before the marker.
+            if start >= 4:
+                declared = struct.unpack_from("<I", data, start - 4)[0]
+                if declared in KEY_LEN_HINTS:
+                    off = start - 4 - 16
+                    if off >= 0:
+                        yield data[off : off + 16]
+            # Fixed layout: key(16) + len(4) + "sAlT".
+            off = start - 20
+            if off >= 0:
+                yield data[off : off + 16]
+            # Marker directly after the key, and other alignments.
+            for delta in (16, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64):
+                off = start - delta - 16
+                if off >= 0:
+                    yield data[off : off + 16]
+            start = data.find(marker, start + 1)
+
+
+def _scan_salt_markers(
+    regions_read,
+    db_files,
+    remaining_salts,
+    key_map,
+    tried_keys,
+) -> None:
+    """Strategy 2: find the key in the object stored next to the KDF marker."""
+    for data in regions_read:
+        for candidate in _iter_marker_keys(data):
+            if len(candidate) != 16 or candidate in tried_keys:
+                continue
+            if candidate == b"\x00" * 16 or len(set(candidate)) < 4:
+                continue
+            tried_keys.add(candidate)
+            for salt_hex in list(remaining_salts):
+                for rel, path, size, salt, page1 in db_files:
+                    if salt != salt_hex:
+                        continue
+                    ok, _ = _verify_key_wxwork(candidate, page1)
+                    if ok:
+                        key_map[salt_hex] = candidate.hex()
+                        remaining_salts.discard(salt_hex)
+                    break
+            if not remaining_salts:
+                return
+
+
 def extract_key(
     db_dir: Optional[str] = None,
     timeout: int = 120,
     verbose: bool = False,
+    process_names: Optional[list[str]] = None,
 ) -> dict[str, str]:
-    """Extract decryption keys from WXWork.exe process memory.
+    """Extract decryption keys from the WeCom client's process memory.
 
     Args:
         db_dir: Path to WeCom data directory. Auto-detected if None.
         timeout: Max seconds for struct scan per process.
         verbose: Print progress to stderr.
+        process_names: Executable names to scan. Defaults to ``WXWork.exe``;
+            pass e.g. ``["airchina.exe"]`` for a private-deployment build.
 
     Returns:
         Dict mapping salt_hex -> enc_key_hex for each database found.
         Also includes "_db_dir" key with the database directory path.
 
     Raises:
-        RuntimeError: If WXWork.exe is not running or no keys found.
+        RuntimeError: If no client process is running or no keys found.
     """
     if db_dir is None:
         db_dir = _auto_detect_db_dir()
@@ -186,32 +397,50 @@ def extract_key(
     if not db_files:
         raise RuntimeError(f"No encrypted databases found in {db_dir}")
 
-    pids = _get_wxwork_pids()
+    names = resolve_process_names(db_dir, process_names)
+    pids = []
+    for name in names:
+        pids.extend(_get_wxwork_pids(name))
     if not pids:
-        raise RuntimeError("WXWork.exe is not running")
+        raise RuntimeError(
+            f"None of {names} is running. "
+            "Start the WeCom client, or pass --process-name <exe> "
+            "(private-deployment builds rename WXWork.exe, e.g. airchina.exe)."
+        )
+    if verbose:
+        print(f"[*] Scanning {len(pids)} process(es) for {', '.join(names)}")
 
     key_map = {}
     remaining_salts = set(salt_to_dbs.keys())
     hex_re = re.compile(b"x'([0-9a-fA-F]{32,192})'")
 
+    # Largest working set first: the UI process is usually the one holding the
+    # cipher objects, and private deployments spawn several helper processes.
+    pids.sort(key=lambda item: item[1], reverse=True)
+
     for pid, mem_kb in pids:
         handle = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
         if not handle:
+            if verbose:
+                print(f"[!] pid {pid}: cannot open (needs admin privileges)")
             continue
 
+        tried_keys = set()
         try:
             regions = _enum_memory_regions(handle)
             total_bytes = sum(s for _, s in regions)
 
-            # Strategy 1: x'...' pattern scan
+            # Strategies 1 + 2 need the raw bytes only; walk regions once.
             for base, size in regions:
                 data = _read_process_memory(handle, base, size)
                 if not data:
                     continue
 
+                # Strategy 1: x'...' pattern scan
                 for m in hex_re.finditer(data):
+                    if not remaining_salts:
+                        break
                     hex_str = m.group(1).decode()
-                    addr = base + m.start()
                     hex_len = len(hex_str)
 
                     candidates = []
@@ -230,12 +459,12 @@ def extract_key(
                         enc_key = bytes.fromhex(enc_key_hex)
 
                         targets = (
-                            [(s, salt_to_dbs[s]) for s in remaining_salts if s == salt_hex]
+                            [s for s in remaining_salts if s == salt_hex]
                             if salt_hex
-                            else [(s, salt_to_dbs[s]) for s in remaining_salts]
+                            else list(remaining_salts)
                         )
 
-                        for s, dbs in targets:
+                        for s in targets:
                             for rel, path, sz, salt, page1 in db_files:
                                 if salt == s:
                                     ok, desc = _verify_key_wxwork(enc_key, page1)
@@ -246,12 +475,23 @@ def extract_key(
 
                         if not remaining_salts:
                             break
-                    if not remaining_salts:
-                        break
+
+                # Strategy 2: key stored next to the wxSQLite3 "sAlT" marker.
+                # This is what private-deployment builds expose when they never
+                # build an "x'...'" SQL literal.
+                if remaining_salts and SALT_MARKER in data:
+                    _scan_salt_markers(
+                        [data],
+                        db_files,
+                        remaining_salts,
+                        key_map,
+                        tried_keys,
+                    )
+
                 if not remaining_salts:
                     break
 
-            # Strategy 2: cipher struct scan (if x'...' didn't find all)
+            # Strategy 3: cipher struct scan (if the first two didn't find all)
             if remaining_salts:
                 memory_regions = []
                 for base, size in regions:
@@ -317,7 +557,12 @@ def extract_key(
                     break
 
     if not key_map:
-        raise RuntimeError("Failed to extract any decryption keys from WXWork.exe")
+        raise RuntimeError(
+            "Failed to extract any decryption keys from "
+            + ", ".join(names)
+            + ". Run with --process-name <exe> to force the client process, "
+            "and make sure the client is elevated/admin-readable."
+        )
 
     key_map["_db_dir"] = db_dir
     return key_map

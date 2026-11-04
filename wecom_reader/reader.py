@@ -34,6 +34,7 @@ class WeComReader:
         db_dir: Optional[str] = None,
         decrypted_dir: Optional[str] = None,
         key_map: Optional[dict] = None,
+        process_names: Optional[list[str]] = None,
     ):
         """Initialize reader.
 
@@ -41,10 +42,14 @@ class WeComReader:
             db_dir: Path to WeCom Data directory (auto-detected if None).
             decrypted_dir: Path for decrypted DB output (default: ./wxwork_decrypted).
             key_map: Pre-extracted key map from extract_key(). If None, init() will extract.
+            process_names: Client executable names to scan for the key. When
+                None the client is auto-detected (WXWork.exe, or the renamed
+                binary used by a private deployment, e.g. airchina.exe).
         """
         self._db_dir = db_dir
         self._decrypted_dir = decrypted_dir or os.path.join(os.getcwd(), "wxwork_decrypted")
         self._key_map = key_map
+        self._process_names = process_names
         self._user_map: Optional[dict] = None
 
     @property
@@ -92,7 +97,7 @@ class WeComReader:
         timeout: int = 120,
         verbose: bool = False,
     ) -> dict:
-        """Extract keys from WXWork.exe and decrypt all databases.
+        """Extract keys from the client process and decrypt all databases.
 
         Args:
             timeout: Max seconds for memory scan per process.
@@ -104,9 +109,12 @@ class WeComReader:
         # Extract keys
         if self._key_map is None:
             if verbose:
-                print("[*] Extracting keys from WXWork.exe memory...")
+                print("[*] Extracting keys from client memory...")
             self._key_map = extract_key(
-                db_dir=self._db_dir, timeout=timeout, verbose=verbose
+                db_dir=self._db_dir,
+                timeout=timeout,
+                verbose=verbose,
+                process_names=self._process_names,
             )
 
         self._db_dir = self._key_map.get("_db_dir", self._db_dir)
