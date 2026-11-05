@@ -92,9 +92,32 @@ contacts = reader.contacts(keyword="张三")
 ### Web UI
 
 ```bash
-python -m wecom_reader.web --db-dir "E:\WXWork\<account_id>\Data"
+python -m wecom_reader.web --db-dir "C:\Users\<user>\Documents\airchina\<account_id>\Cache"
 # 浏览器打开 http://127.0.0.1:8765
 ```
+
+界面能力：
+
+- 会话列表滚动分页加载（每页 50 条，可继续加载全部，不受 500 条限制）
+- 会话内搜索 / 全局消息搜索，结果高亮并可跳转定位
+- 消息类型筛选（文本、图片、文件、视频、语音、链接、引用、转发、会议卡片）与日期区间筛选
+- 消息时间线带年份的日期分隔条，聊天窗口上滑自动加载更早消息
+- 图片灯箱预览（点击打开，Esc 关闭）、文件消息显示文件名/大小/下载按钮
+- 头像与媒体接口、一键刷新数据
+
+常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--db-dir` | 必填。企微数据目录，可指向 `Cache` 或 `Data` |
+| `--decrypted-dir` | 解密输出目录，默认 `wxwork_decrypted` |
+| `--media-dir` | 媒体缓存目录，可选；留空自动定位 `Image/File/Video/Voice` |
+| `--self-id` | 当前账号 ID，可选；留空自动识别 |
+| `--port` | 监听端口，默认 `8765` |
+| `--host` | 绑定地址，默认 `127.0.0.1` |
+
+> 需要“刷新”重新解密最新数据时，`--db-dir` 请指向 `Data` 目录（媒体会自动定位到同级 `Cache`）；
+> 指向 `Cache` 时仍可正常浏览，刷新只会重建已有解密数据的索引。
 
 ## 数据库结构
 
