@@ -24,6 +24,7 @@ Thumbs.db
 
 # Project specific
 wxwork_decrypted/
+wxwork_backups/
 wxwork_keys.json
 config.json
 *.db

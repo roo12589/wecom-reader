@@ -372,7 +372,9 @@
     var data = state.status || {};
     var sessions = data.sessions !== undefined ? fmtNum(data.sessions) : '—';
     var messages = data.messages !== undefined && data.messages !== null ? fmtNum(data.messages) : '—';
-    ui.statusLine.textContent = '会话 ' + sessions + ' · 消息 ' + messages;
+    var text = '会话 ' + sessions + ' · 消息 ' + messages;
+    if (data.client_running === false) text += ' · 企微未运行';
+    ui.statusLine.textContent = text;
   }
 
   /* ======================================================================
@@ -2854,9 +2856,32 @@
     setStatusLine();
   }
 
+  async function reloadAfterDataChange() {
+    await reloadStatus();
+    await loadSessions(true);
+    if (!state.currentSession) return;
+    var currentId = state.currentSession.id;
+    var found = null;
+    for (var i = 0; i < state.sessions.length; i += 1) {
+      if (state.sessions[i].id === currentId) {
+        found = state.sessions[i];
+        break;
+      }
+    }
+    if (found) {
+      await openSession(found);
+    } else {
+      await loadMessages({ reset: true, anchorId: null });
+    }
+  }
+
   async function refreshData() {
     if (ui.refreshBtn.disabled) return;
-    var confirmed = window.confirm('刷新将重新解密并载入最新数据，可能需要数秒，是否继续？');
+    if (state.status && state.status.client_running === false) {
+      toast('请先启动并登录企业微信后再刷新数据', true);
+      return;
+    }
+    var confirmed = window.confirm('刷新需要重新从企业微信进程中提取密钥并解密数据，请确保企业微信正在运行。是否继续？');
     if (!confirmed) return;
 
     ui.refreshBtn.disabled = true;
@@ -2868,28 +2893,11 @@
       if (result && result.success === false) {
         throw new Error(result.error || '后端刷新失败');
       }
-      await reloadStatus();
-      await loadSessions(true);
-
-      if (state.currentSession) {
-        var currentId = state.currentSession.id;
-        var found = null;
-        for (var i = 0; i < state.sessions.length; i += 1) {
-          if (state.sessions[i].id === currentId) {
-            found = state.sessions[i];
-            break;
-          }
-        }
-        if (found) {
-          await openSession(found);
-        } else {
-          await loadMessages({ reset: true, anchorId: null });
-        }
-      }
+      await reloadAfterDataChange();
       toast('数据已刷新');
     } catch (err) {
       toast('刷新失败：' + err.message, true);
-      setStatusLine();
+      await reloadStatus();
     } finally {
       ui.refreshBtn.disabled = false;
       ui.refreshBtn.classList.remove('is-loading');
@@ -2897,12 +2905,164 @@
   }
 
   /* ======================================================================
+   * 数据备份与恢复
+   * ==================================================================== */
+
+  function openBackupModal() {
+    if (!ui.backupModal) return;
+    ui.backupModal.hidden = false;
+    loadBackups();
+  }
+
+  function closeBackupModal() {
+    if (!ui.backupModal) return;
+    ui.backupModal.hidden = true;
+  }
+
+  function renderBackups(backups) {
+    var list = ui.backupList;
+    if (!list) return;
+    list.textContent = '';
+    if (!backups || !backups.length) {
+      list.appendChild(makeEl('p', 'backup-empty', '暂无备份文件'));
+      return;
+    }
+    backups.forEach(function (item) {
+      var row = makeEl('div', 'backup-item');
+      var info = makeEl('div', 'backup-info');
+      info.appendChild(makeEl('span', 'backup-name', item.name));
+      info.appendChild(makeEl('span', 'backup-meta',
+        formatDateTime(item.created_at * 1000) + ' · ' + formatBytes(item.size)));
+      row.appendChild(info);
+
+      var actions = makeEl('div', 'backup-actions');
+      var restoreBtn = makeEl('button', 'link-btn', '恢复');
+      restoreBtn.type = 'button';
+      restoreBtn.addEventListener('click', function () {
+        restoreBackup(item.name);
+      });
+      var download = makeEl('a', 'link-btn', '下载');
+      download.href = '/api/backups/' + encodeURIComponent(item.name) + '/download';
+      download.setAttribute('download', item.name);
+      var deleteBtn = makeEl('button', 'link-btn danger', '删除');
+      deleteBtn.type = 'button';
+      deleteBtn.addEventListener('click', function () {
+        deleteBackup(item.name);
+      });
+      actions.appendChild(restoreBtn);
+      actions.appendChild(download);
+      actions.appendChild(deleteBtn);
+      row.appendChild(actions);
+      list.appendChild(row);
+    });
+  }
+
+  async function loadBackups() {
+    if (!ui.backupList) return;
+    ui.backupList.textContent = '';
+    ui.backupList.appendChild(makeEl('p', 'backup-empty', '正在加载备份…'));
+    try {
+      var data = await api('/api/backups', { timeout: 30000 });
+      renderBackups(data.backups || []);
+    } catch (err) {
+      ui.backupList.textContent = '';
+      ui.backupList.appendChild(makeEl('p', 'backup-empty', '备份列表加载失败：' + err.message));
+    }
+  }
+
+  async function createBackup() {
+    if (ui.createBackupBtn.disabled) return;
+    ui.createBackupBtn.disabled = true;
+    ui.createBackupBtn.textContent = '备份中…';
+    try {
+      var data = await api('/api/backups', { method: 'POST', timeout: 120000 });
+      toast('备份完成：' + data.backup.name);
+      await loadBackups();
+      await reloadStatus();
+    } catch (err) {
+      toast('备份失败：' + err.message, true);
+    } finally {
+      ui.createBackupBtn.disabled = false;
+      ui.createBackupBtn.textContent = '立即备份';
+    }
+  }
+
+  async function restoreBackup(name) {
+    var confirmed = window.confirm('恢复将用备份「' + name + '」替换当前已解析的数据，是否继续？');
+    if (!confirmed) return;
+    ui.createBackupBtn.disabled = true;
+    try {
+      await api('/api/backups/' + encodeURIComponent(name) + '/restore', {
+        method: 'POST',
+        timeout: 120000
+      });
+      closeBackupModal();
+      await reloadAfterDataChange();
+      toast('数据已恢复');
+    } catch (err) {
+      toast('恢复失败：' + err.message, true);
+    } finally {
+      ui.createBackupBtn.disabled = false;
+    }
+  }
+
+  async function restoreBackupFromFile(file) {
+    if (!file) return;
+    var confirmed = window.confirm('恢复将用所选备份替换当前已解析的数据，是否继续？');
+    if (!confirmed) {
+      ui.restoreFileInput.value = '';
+      return;
+    }
+    var form = new FormData();
+    form.append('file', file);
+    ui.createBackupBtn.disabled = true;
+    try {
+      var response = await fetch('/api/backups/upload', { method: 'POST', body: form });
+      var text = await response.text();
+      var data = null;
+      try {
+        data = JSON.parse(text);
+      } catch (err) {
+        data = null;
+      }
+      if (!response.ok || (data && data.error)) {
+        throw new Error((data && data.error) || ('HTTP ' + response.status));
+      }
+      closeBackupModal();
+      await reloadAfterDataChange();
+      toast('数据已恢复');
+    } catch (err) {
+      toast('恢复失败：' + err.message, true);
+    } finally {
+      ui.createBackupBtn.disabled = false;
+      ui.restoreFileInput.value = '';
+    }
+  }
+
+  async function deleteBackup(name) {
+    var confirmed = window.confirm('确定删除备份「' + name + '」？');
+    if (!confirmed) return;
+    try {
+      await api('/api/backups/' + encodeURIComponent(name), {
+        method: 'DELETE',
+        timeout: 30000
+      });
+      toast('备份已删除');
+      await loadBackups();
+      await reloadStatus();
+    } catch (err) {
+      toast('删除失败：' + err.message, true);
+    }
+  }
+
+
+  /* ======================================================================
    * 事件绑定与启动
    * ==================================================================== */
 
   function cacheUi() {
     var ids = [
-      'statusLine', 'refreshBtn', 'sidebar', 'sidebarMask', 'modeSessions', 'modeMessages',
+      'statusLine', 'refreshBtn', 'backupBtn', 'sidebar', 'sidebarMask', 'modeSessions', 'modeMessages',
       'searchInput', 'searchClear', 'filterTabs', 'sessionList', 'sessionFooterText',
       'loadMoreSessions', 'emptyState', 'chatView', 'sidebarToggle', 'chatAvatar',
       'chatName', 'chatMeta', 'chatSearchBtn', 'chatInfoBtn', 'latestBtn', 'typeChips',
@@ -2913,6 +3073,7 @@
       'lightboxImg', 'lightboxDownload', 'lightboxStage', 'lightboxPrev', 'lightboxNext',
       'lightboxZoomIn', 'lightboxZoomOut', 'lightboxFit', 'lightboxActual',
       'lightboxPercent', 'lightboxCounter', 'lightboxLocate',
+      'backupModal', 'backupClose', 'createBackupBtn', 'restoreFileInput', 'backupList',
       'toast', 'bootError', 'bootErrorText', 'bootRetry'
     ];
     ids.forEach(function (id) {
@@ -2928,6 +3089,15 @@
     }, SEARCH_DEBOUNCE);
 
     ui.refreshBtn.addEventListener('click', refreshData);
+    ui.backupBtn.addEventListener('click', openBackupModal);
+    ui.backupClose.addEventListener('click', closeBackupModal);
+    ui.backupModal.addEventListener('click', function (event) {
+      if (event.target && event.target.hasAttribute('data-close-backup')) closeBackupModal();
+    });
+    ui.createBackupBtn.addEventListener('click', createBackup);
+    ui.restoreFileInput.addEventListener('change', function () {
+      restoreBackupFromFile(ui.restoreFileInput.files && ui.restoreFileInput.files[0]);
+    });
     ui.modeSessions.addEventListener('click', function () {
       setSearchMode('session');
     });
@@ -3149,6 +3319,10 @@
         return;
       }
       if (event.key !== 'Escape') return;
+      if (ui.backupModal && !ui.backupModal.hidden) {
+        closeBackupModal();
+        return;
+      }
       if (!ui.detailDrawer.hidden) {
         closeDrawer();
         return;

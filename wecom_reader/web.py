@@ -5,6 +5,7 @@ Usage: python -m wecom_reader.web --db-dir E:/WXWork/1688851235369380/Data
 
 import json
 import os
+import tempfile
 from datetime import date, datetime
 
 from flask import Flask, Response, render_template, request, send_file
@@ -238,16 +239,33 @@ def api_refresh():
     current = _get_reader()
     if current is None:
         return _json_error("reader not initialized", 503)
-    if _has_source_databases(current.db_dir):
+
+    # Refreshing requires re-extracting keys from the running client process.
+    # Bail out early so the existing parsed data is left untouched.
+    process = current.client_process_status()
+    if not process.get("running"):
+        names = "、".join(process.get("names") or []) or "企业微信"
         try:
-            result = current.init(verbose=False) or {}
-        except Exception as exc:
-            result = {"success": False, "error": str(exc)}
-    else:
-        # --db-dir may point at a media-only directory (Cache) with no
-        # encrypted databases; the already decrypted data is still refreshable.
-        result = {"success": False}
-    current.invalidate_caches()
+            status = current.status()
+        except Exception:
+            status = None
+        return safe_jsonify({
+            "success": False,
+            "refreshed": False,
+            "client_running": False,
+            "error": f"未检测到企业微信进程（{names}）。请先启动并登录企业微信后再刷新数据，现有数据未受影响。",
+            "status": status,
+        })
+
+    try:
+        # force=True 重新从企业微信进程提取密钥、解密数据库并重建所有缓存。
+        # 即便 --db-dir 最初只指向 Cache 目录（无加密 DB），extract_key 也会
+        # 定位真实的 Data 目录。新数据解密成功前不会清除已有数据。
+        result = current.init(verbose=False, force=True) or {}
+        refresh_error = result.get("error") or ""
+    except Exception as exc:
+        result = {}
+        refresh_error = str(exc) or "刷新失败"
     try:
         status = current.status()
     except Exception as exc:
@@ -256,8 +274,9 @@ def api_refresh():
         current.session_db_path and current.message_db_path
     )
     payload = {
-        "success": ready,
-        "refreshed": ready,
+        "success": ready and not refresh_error,
+        "refreshed": ready and not refresh_error,
+        "client_running": True,
         "decrypted": result.get("decrypted", 0),
         "copied": result.get("copied", 0),
         "failed": result.get("failed", 0),
@@ -265,11 +284,112 @@ def api_refresh():
         "media_dir": result.get("media_dir") or current.media_dir,
         "status": status,
     }
-    if not ready:
-        payload["error"] = result.get("error") or "decryption unavailable"
-    elif result.get("error"):
-        payload["warning"] = result["error"]
+    if refresh_error:
+        # 解密失败时旧数据未被清除，明确告知用户。
+        payload["error"] = refresh_error
+    elif not ready:
+        payload["error"] = "decryption unavailable"
     return safe_jsonify(payload)
+
+
+@app.route("/api/backups")
+def api_backups():
+    current = _get_reader()
+    if current is None:
+        return _json_error("reader not initialized", 503)
+    try:
+        return safe_jsonify({
+            "backup_dir": current.backup_dir,
+            "backups": current.list_backups(),
+        })
+    except Exception as exc:
+        return _json_error(exc, 500)
+
+
+@app.route("/api/backups", methods=["POST"])
+def api_backup_create():
+    current = _get_reader()
+    if current is None:
+        return _json_error("reader not initialized", 503)
+    try:
+        result = current.create_backup()
+        return safe_jsonify({"success": True, "backup": result})
+    except Exception as exc:
+        return _json_error(exc, 500)
+
+
+@app.route("/api/backups/upload", methods=["POST"])
+def api_backup_upload():
+    current = _get_reader()
+    if current is None:
+        return _json_error("reader not initialized", 503)
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return _json_error("缺少备份文件", 400)
+    temp_path = None
+    try:
+        suffix = os.path.splitext(upload.filename)[1] or ".zip"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+            upload.save(handle)
+            temp_path = handle.name
+        result = current.restore_from_zip(temp_path, source_name=upload.filename)
+        return safe_jsonify({"success": True, "restored": result})
+    except Exception as exc:
+        return _json_error(exc, 500)
+    finally:
+        if temp_path and os.path.isfile(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+@app.route("/api/backups/<path:name>/restore", methods=["POST"])
+def api_backup_restore(name):
+    current = _get_reader()
+    if current is None:
+        return _json_error("reader not initialized", 503)
+    try:
+        result = current.restore_backup(name)
+        return safe_jsonify({"success": True, "restored": result})
+    except FileNotFoundError as exc:
+        return _json_error(exc, 404, name=name)
+    except Exception as exc:
+        return _json_error(exc, 500, name=name)
+
+
+@app.route("/api/backups/<path:name>/download")
+def api_backup_download(name):
+    current = _get_reader()
+    if current is None:
+        return _json_error("reader not initialized", 503)
+    try:
+        path = current.backup_path(name)
+    except Exception as exc:
+        return _json_error(exc, 400, name=name)
+    if not os.path.isfile(path):
+        return _json_error("backup not found", 404, name=name)
+    return send_file(
+        path,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=os.path.basename(path),
+        conditional=True,
+    )
+
+
+@app.route("/api/backups/<path:name>", methods=["DELETE"])
+def api_backup_delete(name):
+    current = _get_reader()
+    if current is None:
+        return _json_error("reader not initialized", 503)
+    try:
+        current.delete_backup(name)
+        return safe_jsonify({"success": True, "name": name})
+    except FileNotFoundError as exc:
+        return _json_error(exc, 404, name=name)
+    except Exception as exc:
+        return _json_error(exc, 500, name=name)
 
 
 @app.route("/api/sessions")
@@ -481,6 +601,11 @@ def main():
         "--decrypted-dir", default="wxwork_decrypted", help="Decrypted DB directory"
     )
     parser.add_argument("--media-dir", default=None, help="Media cache directory")
+    parser.add_argument(
+        "--backup-dir",
+        default=None,
+        help="Directory for data backups (default: next to --decrypted-dir)",
+    )
     parser.add_argument("--self-id", type=int, default=None, help="Current account id")
     parser.add_argument("--port", type=int, default=8765, help="Web server port")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
@@ -492,6 +617,7 @@ def main():
         decrypted_dir=args.decrypted_dir,
         media_dir=args.media_dir,
         self_id=args.self_id,
+        backup_dir=args.backup_dir,
     )
 
     try:

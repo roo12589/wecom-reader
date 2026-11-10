@@ -233,6 +233,25 @@ def resolve_process_names(
     return unique
 
 
+def client_process_status(
+    db_dir: Optional[str] = None,
+    process_names: Optional[list[str]] = None,
+) -> dict:
+    """Report whether a WeCom client process is currently running.
+
+    Returns a dict with ``running`` (bool), ``names`` (candidate executable
+    names) and ``running_names`` (candidates that are actually alive).
+    """
+    names = resolve_process_names(db_dir, process_names)
+    running = {name.lower(): name for _, name in _iter_processes()}
+    running_names = [name for name in names if name.lower() in running]
+    return {
+        "running": bool(running_names),
+        "names": names,
+        "running_names": running_names,
+    }
+
+
 def _auto_detect_db_dir() -> Optional[str]:
     """Scan %USERPROFILE%\\Documents\\WXWork\\*\\Data for encrypted DBs."""
     docs = os.path.join(os.environ.get("USERPROFILE", ""), "Documents", "WXWork")

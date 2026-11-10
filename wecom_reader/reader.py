@@ -6,6 +6,8 @@ import re
 import shutil
 import sqlite3
 import threading
+import zipfile
+from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -15,7 +17,7 @@ from .crypto.decrypt import (
     is_wxsqlite3_aes128_page1,
     verify_key,
 )
-from .crypto.key_extract import extract_key
+from .crypto.key_extract import client_process_status, extract_key
 from .db.contact import (
     build_avatar_file_map,
     build_user_info,
@@ -174,6 +176,7 @@ class WeComReader:
         process_names: Optional[list[str]] = None,
         media_dir: Optional[str] = None,
         self_id: Optional[int] = None,
+        backup_dir: Optional[str] = None,
     ):
         """Initialize reader.
 
@@ -186,6 +189,8 @@ class WeComReader:
                 binary used by a private deployment, e.g. airchina.exe).
             media_dir: Directory containing Image/File/Video/Voice (auto-detected).
             self_id: Current account id (auto-detected from session.db when None).
+            backup_dir: Directory for data backups (default: next to the
+                decrypted directory).
         """
         self._db_dir = db_dir
         self._decrypted_dir = decrypted_dir or os.path.join(os.getcwd(), "wxwork_decrypted")
@@ -193,6 +198,7 @@ class WeComReader:
         self._process_names = process_names
         self._media_dir = media_dir
         self._configured_self_id = _as_int(self_id)
+        self._backup_dir = backup_dir
 
         self._cache_lock = threading.RLock()
         self._caches_ready = False
@@ -226,6 +232,13 @@ class WeComReader:
     @property
     def decrypted_dir(self) -> str:
         return self._decrypted_dir
+
+    @property
+    def backup_dir(self) -> str:
+        if not self._backup_dir:
+            parent = os.path.dirname(os.path.abspath(self._decrypted_dir))
+            self._backup_dir = os.path.join(parent, "wxwork_backups")
+        return self._backup_dir
 
     @property
     def self_id(self) -> Optional[int]:
@@ -348,22 +361,42 @@ class WeComReader:
             result.setdefault("self_id", None)
             result.setdefault("media_dir", self._media_dir)
 
+        try:
+            process = self.client_process_status()
+            result["client_running"] = process.get("running", False)
+            result["client_processes"] = process.get("names") or []
+        except Exception:
+            result["client_running"] = None
+            result["client_processes"] = []
+
+        result["backup_dir"] = self.backup_dir
+        result["backups"] = len(self.list_backups())
+
         return result
 
     def init(
         self,
         timeout: int = 120,
         verbose: bool = False,
+        force: bool = False,
     ) -> dict:
         """Extract keys from the client process and decrypt all databases.
 
         Args:
             timeout: Max seconds for memory scan per process.
             verbose: Print progress.
+            force: When True, re-extract keys and wipe the old decrypted
+                directory before decrypting so that data is fully refreshed.
 
         Returns:
             Dict with success status, key count, db count, etc.
         """
+        # Force mode: the old decrypted data is kept until the new decryption
+        # fully succeeds, so a failure never destroys existing data.
+        if force:
+            self._key_map = None
+            self.invalidate_caches()
+
         # Extract keys
         if self._key_map is None:
             if verbose:
@@ -380,7 +413,13 @@ class WeComReader:
             raise RuntimeError("No db_dir found in key map")
 
         # Decrypt databases
-        os.makedirs(self._decrypted_dir, exist_ok=True)
+        target_dir = os.path.abspath(self._decrypted_dir)
+        work_dir = target_dir
+        if force:
+            work_dir = target_dir + ".refresh-tmp"
+            if os.path.isdir(work_dir):
+                shutil.rmtree(work_dir, ignore_errors=True)
+        os.makedirs(work_dir, exist_ok=True)
         success = 0
         copied = 0
         failed = 0
@@ -392,7 +431,7 @@ class WeComReader:
                     continue
                 path = os.path.join(root, name)
                 rel = os.path.relpath(path, self._db_dir)
-                out_path = os.path.join(self._decrypted_dir, rel)
+                out_path = os.path.join(work_dir, rel)
 
                 with open(path, "rb") as f:
                     page1 = f.read(4096)
@@ -429,6 +468,26 @@ class WeComReader:
                 except Exception:
                     failed += 1
 
+        if force:
+            # Only swap in the fresh data when the core databases are present.
+            missing = [
+                name
+                for name in ("session.db", "message.db")
+                if not os.path.isfile(os.path.join(work_dir, name))
+            ]
+            if missing:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                raise RuntimeError(
+                    "刷新失败：未能解密 "
+                    + "、".join(missing)
+                    + "，已保留原有数据。请确认企业微信正在运行后重试。"
+                )
+            try:
+                self._replace_decrypted_dir(work_dir)
+            except Exception:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                raise
+
         # Data on disk may have changed: rebuild lazy caches.
         self._media_dir = (
             self._media_dir
@@ -447,8 +506,193 @@ class WeComReader:
         }
 
     # ------------------------------------------------------------------
+    # Backup / restore
+    # ------------------------------------------------------------------
+
+    def client_process_status(self) -> dict:
+        """Whether the WeCom client process needed for decryption is running."""
+        try:
+            return client_process_status(
+                db_dir=self._db_dir,
+                process_names=self._process_names,
+            )
+        except Exception as exc:
+            return {"running": False, "names": [], "error": str(exc)}
+
+    def list_backups(self) -> list[dict]:
+        """List the backup archives available for restore."""
+        directory = self.backup_dir
+        if not os.path.isdir(directory):
+            return []
+        items = []
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return []
+        for name in names:
+            if not name.lower().endswith(".zip"):
+                continue
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            items.append({
+                "name": name,
+                "size": stat.st_size,
+                "size_mb": round(stat.st_size / 1024 / 1024, 1),
+                "created_at": int(stat.st_mtime),
+            })
+        items.sort(key=lambda item: item["created_at"], reverse=True)
+        return items
+
+    def create_backup(self) -> dict:
+        """Zip the decrypted databases into the backup directory."""
+        source = os.path.abspath(self._decrypted_dir)
+        if not os.path.isdir(source):
+            raise RuntimeError("暂无可备份的数据，请先刷新数据。")
+        files = []
+        for root, dirs, names in os.walk(source):
+            dirs[:] = [d for d in dirs if d not in ("-journal",)]
+            for name in names:
+                if name.endswith(".db"):
+                    files.append(os.path.join(root, name))
+        if not files:
+            raise RuntimeError("暂无可备份的数据，请先刷新数据。")
+
+        os.makedirs(self.backup_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"wecom-backup-{stamp}.zip"
+        path = os.path.join(self.backup_dir, name)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for file_path in files:
+                archive.write(file_path, os.path.relpath(file_path, source))
+
+        return {
+            "name": name,
+            "size": os.path.getsize(path),
+            "files": len(files),
+            "created_at": int(os.path.getmtime(path)),
+            "backup_dir": self.backup_dir,
+        }
+
+    def restore_backup(self, name: str) -> dict:
+        """Restore the decrypted databases from a named archive."""
+        path = self._backup_path(name)
+        if not os.path.isfile(path):
+            raise FileNotFoundError("备份文件不存在")
+        return self.restore_from_zip(path, source_name=name)
+
+    def restore_from_zip(self, zip_path: str, source_name: Optional[str] = None) -> dict:
+        """Replace the decrypted data with the contents of *zip_path*.
+
+        The archive is extracted into a staging directory first; the current
+        data is only swapped out after the archive is verified to contain the
+        core databases.
+        """
+        target = os.path.abspath(self._decrypted_dir)
+        staging = target + ".restore-tmp"
+        if os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+                    normalized = member.filename.replace("\\", "/")
+                    parts = [p for p in normalized.split("/") if p not in ("", ".")]
+                    if not parts or ".." in parts or ":" in parts[0]:
+                        raise ValueError("备份文件包含非法路径")
+                    if not parts[-1].lower().endswith(".db"):
+                        continue
+                    dest = os.path.join(staging, *parts)
+                    os.makedirs(os.path.dirname(dest) or staging, exist_ok=True)
+                    with archive.open(member) as src, open(dest, "wb") as out:
+                        shutil.copyfileobj(src, out)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        missing = [
+            name
+            for name in ("session.db", "message.db")
+            if not os.path.isfile(os.path.join(staging, name))
+        ]
+        if missing:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise RuntimeError(
+                "备份文件不完整（缺少 " + "、".join(missing) + "），已保留原有数据。"
+            )
+
+        try:
+            self._replace_decrypted_dir(staging)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        self._key_map = None
+        self._media_dir = (
+            self._media_dir
+            or resolve_media_dir(self._db_dir)
+            or resolve_media_dir(self._decrypted_dir)
+        )
+        self.invalidate_caches()
+        return {
+            "name": source_name or os.path.basename(zip_path),
+            "decrypted_dir": self._decrypted_dir,
+        }
+
+    def delete_backup(self, name: str) -> None:
+        """Delete a backup archive by name."""
+        path = self._backup_path(name)
+        if not os.path.isfile(path):
+            raise FileNotFoundError("备份文件不存在")
+        os.remove(path)
+
+    def backup_path(self, name: str) -> str:
+        """Resolve the absolute path of a backup archive."""
+        return self._backup_path(name)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _backup_path(self, name: str) -> str:
+        value = str(name or "").strip()
+        if (
+            not value
+            or os.path.basename(value) != value
+            or not value.lower().endswith(".zip")
+            or ".." in value
+        ):
+            raise ValueError("非法的备份文件名")
+        return os.path.join(self.backup_dir, value)
+
+    def _replace_decrypted_dir(self, prepared_dir: str) -> None:
+        """Swap *prepared_dir* into place, restoring the old data on failure."""
+        target = os.path.abspath(self._decrypted_dir)
+        previous = target + ".previous"
+        if os.path.isdir(previous):
+            shutil.rmtree(previous, ignore_errors=True)
+        moved_old = False
+        if os.path.isdir(target):
+            os.replace(target, previous)
+            moved_old = True
+        try:
+            os.replace(prepared_dir, target)
+        except Exception:
+            if moved_old and not os.path.isdir(target):
+                try:
+                    os.replace(previous, target)
+                except OSError:
+                    pass
+            raise
+        if moved_old:
+            shutil.rmtree(previous, ignore_errors=True)
+        self.invalidate_caches()
+
 
     def _get_db_path(self, name: str) -> Optional[str]:
         """Get path to a decrypted database file."""
