@@ -74,6 +74,8 @@
     chatSearchKeyword: '',
     chatSearchResults: [],
     chatSearchTotal: 0,
+    chatSearchOffset: 0,
+    chatSearchHasMore: false,
     chatSearchLoading: false,
 
     tokens: { sessions: 0, messages: 0, search: 0, chatSearch: 0 },
@@ -643,6 +645,8 @@
     state.chatSearchKeyword = '';
     state.chatSearchResults = [];
     state.chatSearchTotal = 0;
+    state.chatSearchOffset = 0;
+    state.chatSearchHasMore = false;
     state.msgTypes = [];
     state.datePreset = 'all';
     state.customStart = '';
@@ -2434,6 +2438,8 @@
       ui.chatSearchInput.value = '';
       state.chatSearchKeyword = '';
       state.chatSearchResults = [];
+      state.chatSearchOffset = 0;
+      state.chatSearchHasMore = false;
       hideChatSearchPanel();
       if (state.highlightKeyword) {
         state.highlightKeyword = '';
@@ -2443,18 +2449,26 @@
     }
   }
 
-  async function runChatSearch() {
+  async function runChatSearch(reset) {
     var keyword = state.chatSearchKeyword.trim();
     if (!state.currentSession) return;
     if (!keyword) {
       state.chatSearchResults = [];
+      state.chatSearchOffset = 0;
+      state.chatSearchHasMore = false;
       hideChatSearchPanel();
       return;
     }
 
     var token = nextToken('chatSearch');
+    var isReset = reset !== false;
     state.chatSearchLoading = true;
     state.chatSearchError = '';
+    if (isReset) {
+      state.chatSearchResults = [];
+      state.chatSearchOffset = 0;
+      state.chatSearchHasMore = false;
+    }
     ui.chatSearchPanel.hidden = false;
     renderChatSearchPanel();
 
@@ -2464,17 +2478,20 @@
           q: keyword,
           session_id: state.currentSession.id,
           limit: SEARCH_PAGE_SIZE,
-          offset: 0
+          offset: isReset ? 0 : state.chatSearchOffset
         }
       });
       if (isStale('chatSearch', token)) return;
-      state.chatSearchResults = data.results || [];
+      var results = data.results || [];
+      state.chatSearchResults = isReset ? results : state.chatSearchResults.concat(results);
       state.chatSearchTotal = Number(data.total) || 0;
+      state.chatSearchOffset = (Number(data.offset) || 0) + results.length;
+      state.chatSearchHasMore = !!data.has_more;
       renderChatSearchPanel();
     } catch (err) {
       if (isStale('chatSearch', token)) return;
       state.chatSearchError = err.message;
-      state.chatSearchResults = [];
+      if (isReset) state.chatSearchResults = [];
       renderChatSearchPanel();
     } finally {
       if (!isStale('chatSearch', token)) {
@@ -2533,6 +2550,16 @@
     state.chatSearchResults.forEach(function (result, index) {
       panel.appendChild(chatSearchResultNode(result, index));
     });
+
+    if (state.chatSearchHasMore) {
+      var more = makeEl('div', 'search-more');
+      var button = makeEl('button', 'ghost-btn', state.chatSearchLoading ? '加载中…' : '加载更多结果');
+      button.type = 'button';
+      button.dataset.chatSearchMore = '1';
+      button.disabled = state.chatSearchLoading;
+      more.appendChild(button);
+      panel.appendChild(more);
+    }
   }
 
   function chatSearchResultNode(result, index) {
@@ -3178,6 +3205,11 @@
     });
 
     ui.chatSearchPanel.addEventListener('click', function (event) {
+      var moreButton = event.target.closest ? event.target.closest('[data-chat-search-more]') : null;
+      if (moreButton) {
+        runChatSearch(false);
+        return;
+      }
       var resultButton = event.target.closest ? event.target.closest('.search-result') : null;
       if (!resultButton) return;
       var index = Number(resultButton.dataset.resultIndex);

@@ -119,6 +119,50 @@ python -m wecom_reader.web --db-dir "C:\Users\<user>\Documents\airchina\<account
 > 需要“刷新”重新解密最新数据时，`--db-dir` 请指向 `Data` 目录（媒体会自动定位到同级 `Cache`）；
 > 指向 `Cache` 时仍可正常浏览，刷新只会重建已有解密数据的索引。
 
+## 打包为桌面应用
+
+打包产物内置 Python 运行时及全部依赖，目标机器**无需安装 Python**。PyInstaller 不支持交叉编译，因此 Windows 包需在 Windows 上构建，macOS 包需在 macOS 上构建（也可用下面的 GitHub Actions 自动构建）。
+
+先安装打包依赖（仅打包机需要）：
+
+```bash
+pip install -r scripts/requirements-build.txt
+```
+
+### Windows
+
+```powershell
+python scripts/build.py --clean
+```
+
+产物：
+
+- `dist\WeComReader.exe`：单文件程序，双击即可运行
+- `dist\WeComReader-<版本>-windows-x64.zip`：便于分发的压缩包
+
+首次运行会自动定位 `Documents\<厂商>\<账号>\Data`；找不到时弹出文件夹选择框。读取聊天密钥需要管理员权限，程序会自动请求提权。
+
+### macOS
+
+```bash
+python3 scripts/build.py --clean
+```
+
+产物：
+
+- `dist/WeCom Reader.app`
+- `dist/WeComReader-<版本>-macos.dmg`
+
+macOS 版用于浏览**已解密**数据：macOS 不支持 Windows 的进程内存扫描，请先在 Windows 上生成 `wxwork_decrypted` 目录并拷贝到 Mac，启动后选择该目录。
+
+未签名产物的首次运行会被系统拦截：Windows 上选择“更多信息 → 仍要运行”；macOS 上右键应用选择“打开”，或执行：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/WeCom Reader.app"
+```
+
+`.github/workflows/build-app.yml` 可在 GitHub Actions 上同时构建 Windows 与 macOS（Apple Silicon）产物，支持手动触发或推送 `v*` 标签。
+
 ## 数据库结构
 
 | 数据库 | 内容 | 大小 |

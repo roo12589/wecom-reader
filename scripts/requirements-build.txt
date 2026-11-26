@@ -1,0 +1,7 @@
+# Runtime dependencies (bundled into the application)
+pycryptodomex>=3.20
+click>=8.0
+flask>=3.0
+
+# Build tooling
+PyInstaller>=6.0

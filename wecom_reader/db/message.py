@@ -230,8 +230,13 @@ def _build_where(
         params.append(int(msg_type))
     if keyword:
         pattern = f"%{keyword}%"
-        clauses.append("(CAST(content AS TEXT) LIKE ? OR content LIKE ?)")
-        params.extend([pattern, pattern])
+        clauses.append(
+            "(CAST(content AS TEXT) LIKE ? OR content LIKE ? "
+            "OR CAST(extra_content AS TEXT) LIKE ? OR extra_content LIKE ? "
+            "OR instr(CAST(content AS BLOB), CAST(? AS BLOB)) > 0 "
+            "OR instr(CAST(extra_content AS BLOB), CAST(? AS BLOB)) > 0)"
+        )
+        params.extend([pattern, pattern, pattern, pattern, keyword, keyword])
     if start_time is not None:
         clauses.append("send_time >= ?")
         params.append(int(start_time))

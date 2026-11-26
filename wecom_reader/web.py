@@ -55,6 +55,12 @@ def _get_reader():
     return reader
 
 
+def set_reader(value: WeComReader) -> None:
+    """Install the reader used by the API (called by the desktop launcher)."""
+    global reader
+    reader = value
+
+
 def _int_arg(name, default, minimum=None, maximum=None):
     """Parse an integer query parameter without ever raising."""
     raw = request.args.get(name)

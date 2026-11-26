@@ -15,35 +15,49 @@ Requires: Windows, admin privileges, the client running.
 
 import bisect
 import ctypes
-import ctypes.wintypes as wt
 import os
 import re
 import struct
 import subprocess
+import sys
 import time
 from typing import Optional
 
 from .decrypt import is_plain_sqlite, is_wxsqlite3_aes128_page1, verify_key
 
+IS_WINDOWS = sys.platform == "win32"
+
+if IS_WINDOWS:
+    import ctypes.wintypes as wt
+
+    kernel32 = ctypes.windll.kernel32
+else:  # importing this module on macOS/Linux must not fail
+    wt = None
+    kernel32 = None
+
 # Windows API constants
-kernel32 = ctypes.windll.kernel32
 MEM_COMMIT = 0x1000
 READABLE = {0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}
 
 
-class MBI(ctypes.Structure):
-    """MEMORY_BASIC_INFORMATION for VirtualQueryEx."""
-    _fields_ = [
-        ("BaseAddress", ctypes.c_uint64),
-        ("AllocationBase", ctypes.c_uint64),
-        ("AllocationProtect", wt.DWORD),
-        ("_pad1", wt.DWORD),
-        ("RegionSize", ctypes.c_uint64),
-        ("State", wt.DWORD),
-        ("Protect", wt.DWORD),
-        ("Type", wt.DWORD),
-        ("_pad2", wt.DWORD),
-    ]
+if IS_WINDOWS:
+
+    class MBI(ctypes.Structure):
+        """MEMORY_BASIC_INFORMATION for VirtualQueryEx."""
+        _fields_ = [
+            ("BaseAddress", ctypes.c_uint64),
+            ("AllocationBase", ctypes.c_uint64),
+            ("AllocationProtect", wt.DWORD),
+            ("_pad1", wt.DWORD),
+            ("RegionSize", ctypes.c_uint64),
+            ("State", wt.DWORD),
+            ("Protect", wt.DWORD),
+            ("Type", wt.DWORD),
+            ("_pad2", wt.DWORD),
+        ]
+
+else:
+    MBI = None
 
 
 def _read_process_memory(handle, addr: int, size: int) -> Optional[bytes]:
@@ -88,6 +102,8 @@ EXCLUDED_PROCESS_NAMES = frozenset({"airchina5.0.exe"})
 
 def _iter_processes() -> list[tuple[int, str]]:
     """List running (pid, exe_name) pairs via a Toolhelp snapshot."""
+    if not IS_WINDOWS:
+        return []
     TH32CS_SNAPPROCESS = 0x00000002
 
     class _PROCESSENTRY32(ctypes.Structure):
@@ -404,6 +420,13 @@ def extract_key(
     Raises:
         RuntimeError: If no client process is running or no keys found.
     """
+    if not IS_WINDOWS:
+        raise RuntimeError(
+            "Key extraction is only supported on Windows. On macOS, copy a "
+            "decrypted 'wxwork_decrypted' directory from Windows and open it "
+            "with --decrypted-dir."
+        )
+
     if db_dir is None:
         db_dir = _auto_detect_db_dir()
     if not db_dir or not os.path.isdir(db_dir):
